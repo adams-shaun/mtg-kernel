@@ -20,8 +20,8 @@ use crate::policy_surface_v5::{
     POLICY_ENVIRONMENT_HASH_ALGORITHM_ENVIRONMENT_V2, POLICY_SURFACE_VERSION,
 };
 use crate::rl::{
-    build_deck_pair_state, core_policy_action_candidates_v5, observe_policy_v5,
-    observe_policy_v5_unhashed_for_flat_policy, parse_strict_json_value,
+    build_deck_pair_state, core_policy_action_candidates_v5, legal_action_candidates_v5,
+    observe_policy_v5, observe_policy_v5_unhashed_for_flat_policy, parse_strict_json_value,
     policy_legal_action_candidates_v5, ActionSemanticV1, CardStableRefV1,
     CorePolicyActionCandidateV1, EpisodeTerminalSummaryV1, LegalActionV5, ObservationV5,
     PlayerSeatV1, PolicyLegalActionCandidateV5, RlContractError, TargetRefV1,
@@ -3857,6 +3857,16 @@ enum FastActorApplyPathV1 {
     CloneReference,
 }
 
+/// Which answers a session offers at a combat scan step. JSONL sessions keep
+/// the original `[include: false, include: true]` pair, which Python's V5
+/// encoder (`features.py`) requires; in-process sessions offer only the
+/// answers that keep a legal completion of the declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanMenuV1 {
+    OriginalPair,
+    LegalAnswersOnly,
+}
+
 #[derive(Clone)]
 pub struct RlEpisodeSessionV1 {
     deck_ids: SessionDeckIdsV1,
@@ -3871,6 +3881,7 @@ pub struct RlEpisodeSessionV1 {
     physical_decision_count: u64,
     current: Option<CurrentDecisionV1>,
     terminal: Option<RlSessionTerminalV1>,
+    scan_menu: ScanMenuV1,
 }
 
 #[derive(Clone)]
@@ -3973,6 +3984,7 @@ impl RlEpisodeSessionV1 {
             max_policy_steps,
             deck_ids,
             None,
+            ScanMenuV1::LegalAnswersOnly,
         )
     }
 
@@ -3983,6 +3995,7 @@ impl RlEpisodeSessionV1 {
         max_policy_steps: u64,
         deck_ids: SessionDeckIdsV1,
         profile: Option<&mut RlPhaseProfileV1>,
+        scan_menu: ScanMenuV1,
     ) -> Result<Self, RlSessionError> {
         Self::reset_with_decks_and_limits_profiled_in_audit_mode(
             episode_id,
@@ -3992,9 +4005,11 @@ impl RlEpisodeSessionV1 {
             deck_ids,
             profile,
             SuppressionAuditMode::Off,
+            scan_menu,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn reset_with_decks_and_limits_profiled_in_audit_mode(
         episode_id: u64,
         env_seed: u64,
@@ -4003,6 +4018,7 @@ impl RlEpisodeSessionV1 {
         deck_ids: SessionDeckIdsV1,
         profile: Option<&mut RlPhaseProfileV1>,
         suppression_audit_mode: SuppressionAuditMode,
+        scan_menu: ScanMenuV1,
     ) -> Result<Self, RlSessionError> {
         Self::reset_with_decks_and_limits_profiled_in_audit_mode_with_randomization(
             episode_id,
@@ -4012,6 +4028,7 @@ impl RlEpisodeSessionV1 {
             deck_ids,
             profile,
             suppression_audit_mode,
+            scan_menu,
         )
     }
 
@@ -4035,6 +4052,7 @@ impl RlEpisodeSessionV1 {
             max_policy_steps,
             deck_ids,
             None,
+            ScanMenuV1::LegalAnswersOnly,
         )
     }
 
@@ -4048,6 +4066,7 @@ impl RlEpisodeSessionV1 {
         max_policy_steps: u64,
         deck_ids: SessionDeckIdsV1,
         profile: Option<&mut RlPhaseProfileV1>,
+        scan_menu: ScanMenuV1,
     ) -> Result<Self, RlSessionError> {
         Self::reset_with_decks_and_limits_profiled_in_audit_mode_with_randomization(
             episode_id,
@@ -4059,9 +4078,11 @@ impl RlEpisodeSessionV1 {
             deck_ids,
             profile,
             SuppressionAuditMode::Off,
+            scan_menu,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn reset_with_decks_and_limits_profiled_in_audit_mode_with_randomization(
         episode_id: u64,
         randomization: ResetRandomization,
@@ -4070,6 +4091,7 @@ impl RlEpisodeSessionV1 {
         deck_ids: SessionDeckIdsV1,
         mut profile: Option<&mut RlPhaseProfileV1>,
         suppression_audit_mode: SuppressionAuditMode,
+        scan_menu: ScanMenuV1,
     ) -> Result<Self, RlSessionError> {
         let mut session = measure_optional(&mut profile, RlPhaseV1::Reset, || {
             // `RlEpisodeSessionV1` does not (yet) expose a starting-player
@@ -4094,6 +4116,7 @@ impl RlEpisodeSessionV1 {
                 physical_decision_count: 0,
                 current: None,
                 terminal: None,
+                scan_menu,
             })
         })?;
         session.advance_to_decision_or_terminal_profiled(profile);
@@ -4433,22 +4456,26 @@ impl RlEpisodeSessionV1 {
                 return;
             }
         };
-        let candidates = match measure_optional(&mut profile, RlPhaseV1::Actions, || {
-            policy_legal_action_candidates_v5(&surfaced, &self.surface, &self.state)
-        }) {
-            Ok(candidates) => candidates,
-            Err(err) => {
-                self.terminal = Some(halted_terminal(
-                    &self.deck_ids,
-                    self.deck_hashes,
-                    self.episode_id,
-                    format!("fail_closed:{err}"),
-                    self.policy_step_count,
-                    self.physical_decision_count,
-                ));
-                return;
-            }
-        };
+        let candidates =
+            match measure_optional(&mut profile, RlPhaseV1::Actions, || match self.scan_menu {
+                ScanMenuV1::OriginalPair => legal_action_candidates_v5(&surfaced, &self.state),
+                ScanMenuV1::LegalAnswersOnly => {
+                    policy_legal_action_candidates_v5(&surfaced, &self.surface, &self.state)
+                }
+            }) {
+                Ok(candidates) => candidates,
+                Err(err) => {
+                    self.terminal = Some(halted_terminal(
+                        &self.deck_ids,
+                        self.deck_hashes,
+                        self.episode_id,
+                        format!("fail_closed:{err}"),
+                        self.policy_step_count,
+                        self.physical_decision_count,
+                    ));
+                    return;
+                }
+            };
         if candidates.is_empty() {
             self.terminal = Some(halted_terminal(
                 &self.deck_ids,
@@ -6498,6 +6525,7 @@ impl KernelRlJsonlServerV1 {
                     max_policy_steps,
                     deck_ids,
                     profile.as_deref_mut(),
+                    ScanMenuV1::OriginalPair,
                 ) {
                     Ok(session) => session,
                     Err(err) => {
@@ -6600,6 +6628,7 @@ impl KernelRlJsonlServerV1 {
                         max_policy_steps,
                         deck_ids,
                         profile.as_deref_mut(),
+                        ScanMenuV1::OriginalPair,
                     ) {
                         Ok(session) => session,
                         Err(err) => {
@@ -7111,9 +7140,9 @@ mod tests {
         reset_test_exact_surface_hash_calls, test_exact_surface_hash_calls,
     };
     use crate::rl::{
-        card_name, legal_action_candidates_v5, make_legal_action_v5,
-        reset_test_policy_v5_materialization_calls, test_policy_v5_materialization_calls,
-        validate_core_policy_action_candidates_v5, ActionSemanticV1, CardStableRefV1,
+        card_name, make_legal_action_v5, reset_test_policy_v5_materialization_calls,
+        test_policy_v5_materialization_calls, validate_core_policy_action_candidates_v5,
+        ActionSemanticV1, CardStableRefV1,
     };
     use crate::state::{Counters, GameObject, GameState, ObjectStateV4, SplitMix64, Step, Zone};
     use std::collections::HashSet;
@@ -7631,6 +7660,14 @@ mod tests {
         session
     }
 
+    fn goad(state: &mut GameState, attacker: crate::ids::ObjectId) {
+        let expires_at_turn = state.turn + 1;
+        state.objects.get_mut(attacker).v4.goaded_by = vec![crate::state::GoadStateV4 {
+            player: PlayerId::P1,
+            expires_at_turn,
+        }];
+    }
+
     fn offered_includes(response: &RlSessionResponseV1) -> Vec<bool> {
         let RlSessionResponseV1::Decision(decision) = response else {
             panic!("expected decision");
@@ -7667,11 +7704,7 @@ mod tests {
     fn session_offers_only_the_inclusion_of_a_goaded_attacker() {
         let mut state = attacker_state(2);
         let goaded = state.players[0].battlefield[0];
-        let expires_at_turn = state.turn + 1;
-        state.objects.get_mut(goaded).v4.goaded_by = vec![crate::state::GoadStateV4 {
-            player: PlayerId::P1,
-            expires_at_turn,
-        }];
+        goad(&mut state, goaded);
         let mut session = session_from_state(state);
         let response = session.current_response();
         let RlSessionResponseV1::Decision(decision) = &response else {
@@ -7753,14 +7786,10 @@ mod tests {
         for count in 1..=3 {
             for goad_mask in 0..(1usize << count) {
                 let mut state = attacker_state(count);
-                let expires_at_turn = state.turn + 1;
                 for index in 0..count {
                     if goad_mask & (1 << index) != 0 {
                         let id = state.players[0].battlefield[index];
-                        state.objects.get_mut(id).v4.goaded_by = vec![crate::state::GoadStateV4 {
-                            player: PlayerId::P1,
-                            expires_at_turn,
-                        }];
+                        goad(&mut state, id);
                     }
                 }
                 assert_session_offers_exactly_the_completable_answers(
@@ -7797,6 +7826,42 @@ mod tests {
         }
     }
 
+    /// Python's V5 encoder (`features.py`) requires both answers at every
+    /// combat scan step, so sessions reset through the JSONL wire keep the
+    /// original pair even where one answer would strand the scan. The surface
+    /// still refuses that answer, with the engine's text, if it is picked.
+    #[test]
+    fn jsonl_sessions_keep_the_original_scan_pair_for_the_python_v5_encoder() {
+        for reset in [v5_reset_line("r5", 91, 8), v6_reset_line("r6", 91, 8)] {
+            let mut server = KernelRlJsonlServerV1::new();
+            server.handle_line(&reset);
+            let session = &mut server.active.as_mut().expect("active session").session;
+            let mut state = attacker_state(2);
+            let goaded = state.players[0].battlefield[0];
+            goad(&mut state, goaded);
+            session.state = state;
+            session.surface = PolicySurfaceV5::new_for_session();
+            session.environment_revision = 0;
+            session.policy_step_count = 0;
+            session.physical_decision_count = 0;
+            session.current = None;
+            session.terminal = None;
+            session.advance_to_decision_or_terminal();
+
+            let response = session.current_response();
+            assert_eq!(offered_includes(&response), vec![false, true]);
+            let (step, index, id) = action_at(&response, 0);
+            let error = session.step(1, step, index, &id).unwrap_err();
+            assert_eq!(
+                error.message,
+                "selected action no longer matches the active policy environment: \
+                 one or more goaded creatures able to attack was omitted"
+            );
+            let (step, index, id) = action_at(&response, 1);
+            session.step(1, step, index, &id).unwrap();
+        }
+    }
+
     /// The fast actor still offers the original pair. Declining a goaded
     /// attacker is rejected before mutation by the same rule the policy
     /// session filters with, and stays retryable instead of halting the
@@ -7805,11 +7870,7 @@ mod tests {
     fn fast_actor_rejects_declining_a_goaded_attacker_before_mutation() {
         let mut state = attacker_state(2);
         let goaded = state.players[0].battlefield[0];
-        let expires_at_turn = state.turn + 1;
-        state.objects.get_mut(goaded).v4.goaded_by = vec![crate::state::GoadStateV4 {
-            player: PlayerId::P1,
-            expires_at_turn,
-        }];
+        goad(&mut state, goaded);
         let mut session = FastActorSessionV1::reset_with_limits(23, 91, 8, 8);
         session.state = state;
         session.surface = PolicySurfaceV5::new();
@@ -8500,6 +8561,7 @@ mod tests {
             [deck_id.to_string(), deck_id.to_string()],
             None,
             mode,
+            ScanMenuV1::LegalAnswersOnly,
         )
         .unwrap()
     }
