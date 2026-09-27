@@ -36,9 +36,11 @@ benchmark, task B, sections 2 and 3.
   and `legal_action_candidates_v5` keep the original pair (the flat V1/V2 origin
   contract). The V5 episode validator accepts the pair or one answer bound to
   the current candidate.
-- `rl_session.rs`: `RlEpisodeSessionV1` (JSONL server, Spellbench bridge) offers
-  the filtered list; a refused step keeps code `stale_environment_binding` and
-  appends the refusal text.
+- `rl_session.rs`: an in-process `RlEpisodeSessionV1` (Spellbench bridge, Rust
+  episode recorders) offers the filtered list. Sessions the JSONL server resets
+  keep the original pair, which Python's V5 encoder requires; the surface still
+  refuses a stranding answer if a JSONL client picks it. A refused step keeps
+  code `stale_environment_binding` and appends the refusal text.
 - `event.rs`: `cease_to_exist` drops rows whose exiled object is the ceasing id.
   Rows naming it only as source are kept (a token source's pending return
   resolves from its row).
@@ -47,11 +49,11 @@ benchmark, task B, sections 2 and 3.
 
 | Surface | Change |
 |---|---|
-| JSONL V5 / `RlEpisodeSessionV1` | At a forced scan step (goad, or a block that must end empty or reach the minimum) `legal_actions` has 1 entry, not 2; `selected_index`, environment and core hashes change there. Seeded runs with a sampling policy diverge from that step. |
+| In-process `RlEpisodeSessionV1` | At a forced scan step (goad, or a block that must end empty or reach the minimum) `legal_actions` has 1 entry, not 2; `selected_index`, environment and core hashes change there. Seeded runs with a sampling policy diverge from that step. |
+| JSONL wire (V5 and V6) and Python clients | Menus unchanged, so `features.py` (V5, hash-pinned) keeps working. A stranding pick is now refused at that step, with the engine's text, instead of at the end of the scan; picks that keep a legal declaration behave as before. |
 | Previously halted games | Elves goad dead ends and CawGates linked-exile halts now continue. |
 | `FastActorSessionV1` flat V1/V2 | Candidate sets unchanged. An infeasible pick is refused at that step (retryable, same code) instead of stranding the scan. No completed trajectory changes. |
 | Pinned goldens on `main` | None moved (full suite below). No pinned trajectory uses Elves or CawGates. |
-| Python `features.py` (V5, hash-pinned) | Unchanged; still requires two scan answers. A Python V5 consumer now fails closed (`FeatureSchemaError`) at a forced Elves step instead of being offered an illegal answer. Burn/Rally unaffected. Relaxing it needs the authority-succession process. |
 
 ## Fable cross-examination (2026-09-26)
 
@@ -76,16 +78,29 @@ D7 accept with a disclosure requirement. Material points and dispositions:
    the frozen flat V1/V2 origin contract (`flat_validate_origin_decision_v1`
    maps index to include). **Accepted**: the session-layer boundary (D2).
 5. Python V5 consumers (`client.py`, `trainer.py`, `rollout.py`,
-   `sampled_evaluator.py`) fail closed on forced Elves steps. **Accepted**:
-   reported here; no `features.py` change.
+   `sampled_evaluator.py`) would fail closed on forced Elves steps.
+   **Superseded** by the channel split after the Codex review below: JSONL
+   menus are unchanged; no `features.py` change.
 6. With menace (minimum 2) every infeasible answer is a final answer the commit
    already refused, so the mid-scan refusal matters for goad and minimum 3+.
    Informational; the oracle covers minima 1 to 3.
 
+## Codex diff review (2026-09-26)
+
+One-shot `codex exec review --base main` (gpt-6-astra, xhigh effort). One P1:
+single-answer menus on the existing JSONL protocol break Python's V5 encoder
+(`features.py` rejects them and `client.py` raises `ProtocolError`), aborting
+Python-driven Elves episodes, including ones that would have continued.
+**Accepted**: menus are split by channel. JSONL-reset sessions keep the
+original pair on both wire versions; in-process sessions filter.
+`jsonl_sessions_keep_the_original_scan_pair_for_the_python_v5_encoder` covers
+it.
+
 ## Census (not a golden)
 
 Uniform random choice over the offered actions (splitmix64, fixed seeds),
-`RlEpisodeSessionV1`, mirrors, 300 env seeds per deck, 600-decision cap.
+in-process `RlEpisodeSessionV1`, mirrors, 300 env seeds per deck,
+600-decision cap.
 Episodes by how they ended:
 
 | Deck | Build | Game over | Decision cap | Refused scan answer | Linked-exile halt | Zero-legal-actions halt |
