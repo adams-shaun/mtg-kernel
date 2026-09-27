@@ -94,7 +94,19 @@ Python-driven Elves episodes, including ones that would have continued.
 **Accepted**: menus are split by channel. JSONL-reset sessions keep the
 original pair on both wire versions; in-process sessions filter.
 `jsonl_sessions_keep_the_original_scan_pair_for_the_python_v5_encoder` covers
-it.
+it. A second one-shot review of the result found no actionable regressions.
+
+Fable's focused check of the split (same reviewer): **accept**. Both JSONL
+reset paths are covered (the retry path constructs nothing; the server never
+restores). For Python V5 the change is a strict improvement but not a fix: a
+policy that declines a goaded creature still aborts, now at that step with
+the engine's text, so Bug 1 is fixed for in-process consumers. Burn/Rally
+menus, hashes and transcript goldens are unchanged. Named failure mode: two
+menu behaviours share one type and wire version with no visible marker, so
+comparing an in-process Elves or Spy episode (Troll of Khazad-dum needs three
+blockers) with a JSONL replay would differ at forced steps. **Accepted**:
+comments on `prove_fast_actor_parity` and on the Burn-only V5 recorder, whose
+records Python consumes.
 
 ## Census (not a golden)
 

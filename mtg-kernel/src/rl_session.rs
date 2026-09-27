@@ -8340,6 +8340,10 @@ mod tests {
         assert_eq!(test_policy_v5_materialization_calls(), (0, 1));
     }
 
+    /// Full and fast sessions offer equal candidates only where no combat scan
+    /// answer is filtered: the in-process full session drops answers without a
+    /// legal completion (goad, blocker minimums), the fast actor keeps the
+    /// original pair. Burn and Rally have neither.
     fn prove_fast_actor_parity(deck_id: &str, seed: u64) {
         let episode_id = seed ^ 0xFA57_AC70_0000_0001;
         let deck_ids = [deck_id.to_string(), deck_id.to_string()];

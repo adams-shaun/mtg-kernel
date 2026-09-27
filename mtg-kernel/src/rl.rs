@@ -2663,6 +2663,11 @@ pub fn record_burn_mirror_episode(
     )
 }
 
+/// Records through an in-process session, which drops combat scan answers
+/// without a legal completion. Python's V5 encoder (`features.py`) reads these
+/// records and requires both answers at every scan step; the Burn mirror never
+/// has a filtered step. A recorder for other decks must offer the JSONL
+/// server's original pair.
 pub fn record_burn_mirror_episode_with_limits(
     episode_id: u64,
     env_seed: u64,
