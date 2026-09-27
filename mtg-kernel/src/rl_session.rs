@@ -20,11 +20,12 @@ use crate::policy_surface_v5::{
     POLICY_ENVIRONMENT_HASH_ALGORITHM_ENVIRONMENT_V2, POLICY_SURFACE_VERSION,
 };
 use crate::rl::{
-    build_deck_pair_state, core_policy_action_candidates_v5, legal_action_candidates_v5,
-    observe_policy_v5, observe_policy_v5_unhashed_for_flat_policy, parse_strict_json_value,
-    ActionSemanticV1, CardStableRefV1, CorePolicyActionCandidateV1, EpisodeTerminalSummaryV1,
-    LegalActionV5, ObservationV5, PlayerSeatV1, PolicyLegalActionCandidateV5, RlContractError,
-    TargetRefV1, TerminalClassificationV1, TerminalOutcomeV1, TerminalSafeCodeV2,
+    build_deck_pair_state, core_policy_action_candidates_v5, observe_policy_v5,
+    observe_policy_v5_unhashed_for_flat_policy, parse_strict_json_value,
+    policy_legal_action_candidates_v5, ActionSemanticV1, CardStableRefV1,
+    CorePolicyActionCandidateV1, EpisodeTerminalSummaryV1, LegalActionV5, ObservationV5,
+    PlayerSeatV1, PolicyLegalActionCandidateV5, RlContractError, TargetRefV1,
+    TerminalClassificationV1, TerminalOutcomeV1, TerminalSafeCodeV2,
 };
 use crate::runtime_decks::{runtime_deck_by_id, RuntimeDeckDefinition, RUNTIME_DECKS};
 use crate::state::{Target, Zone};
@@ -4292,10 +4293,12 @@ impl RlEpisodeSessionV1 {
                 next_environment_revision,
             )
         })
-        .map_err(|_| {
+        .map_err(|refusal| {
             session_error(
                 RlSessionErrorCode::StaleEnvironmentBinding,
-                "selected action no longer matches the active policy environment",
+                &format!(
+                    "selected action no longer matches the active policy environment: {refusal}"
+                ),
             )
         })?;
         self.current = None;
@@ -4431,7 +4434,7 @@ impl RlEpisodeSessionV1 {
             }
         };
         let candidates = match measure_optional(&mut profile, RlPhaseV1::Actions, || {
-            legal_action_candidates_v5(&surfaced, &self.state)
+            policy_legal_action_candidates_v5(&surfaced, &self.surface, &self.state)
         }) {
             Ok(candidates) => candidates,
             Err(err) => {
@@ -7108,9 +7111,9 @@ mod tests {
         reset_test_exact_surface_hash_calls, test_exact_surface_hash_calls,
     };
     use crate::rl::{
-        card_name, make_legal_action_v5, reset_test_policy_v5_materialization_calls,
-        test_policy_v5_materialization_calls, validate_core_policy_action_candidates_v5,
-        ActionSemanticV1, CardStableRefV1,
+        card_name, legal_action_candidates_v5, make_legal_action_v5,
+        reset_test_policy_v5_materialization_calls, test_policy_v5_materialization_calls,
+        validate_core_policy_action_candidates_v5, ActionSemanticV1, CardStableRefV1,
     };
     use crate::state::{Counters, GameObject, GameState, ObjectStateV4, SplitMix64, Step, Zone};
     use std::collections::HashSet;
@@ -7594,6 +7597,239 @@ mod tests {
 
         session.restore_v5(&snapshot);
         assert!(session.step(23, step, include_index, &include_id).is_ok());
+    }
+
+    /// The session error for a refused apply names the refusal instead of
+    /// only the fixed binding text.
+    #[test]
+    fn refused_apply_carries_the_surface_refusal_text() {
+        let mut session = attacker_session(1, 8, 8);
+        let response = session.current_response();
+        let (step, include_index, include_id) = action_at(&response, 1);
+        session.state.players[0].battlefield.clear();
+        let error = session
+            .step(23, step, include_index, &include_id)
+            .unwrap_err();
+        assert_eq!(error.code, RlSessionErrorCode::StaleEnvironmentBinding);
+        assert_eq!(
+            error.message,
+            "selected action no longer matches the active policy environment: \
+             one or more declared attackers is not an eligible attacker"
+        );
+    }
+
+    fn session_from_state(state: GameState) -> RlEpisodeSessionV1 {
+        let mut session = RlEpisodeSessionV1::reset_with_limits(23, 91, 8, 8);
+        session.state = state;
+        session.surface = PolicySurfaceV5::new();
+        session.environment_revision = 0;
+        session.policy_step_count = 0;
+        session.physical_decision_count = 0;
+        session.current = None;
+        session.terminal = None;
+        session.advance_to_decision_or_terminal();
+        session
+    }
+
+    fn offered_includes(response: &RlSessionResponseV1) -> Vec<bool> {
+        let RlSessionResponseV1::Decision(decision) = response else {
+            panic!("expected decision");
+        };
+        decision
+            .legal_actions
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                assert_eq!(action.selected_index as usize, index);
+                match &action.semantic {
+                    ActionSemanticV1::ChooseAttackerInclusion { include, .. }
+                    | ActionSemanticV1::ChooseBlockerInclusion { include, .. } => *include,
+                    other => panic!("expected a combat scan answer, got {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    fn step_include(session: &mut RlEpisodeSessionV1, include: bool) -> RlSessionResponseV1 {
+        let response = session.current_response();
+        let index = offered_includes(&response)
+            .iter()
+            .position(|offered| *offered == include)
+            .expect("answer is offered");
+        let (step, selected_index, id) = action_at(&response, index);
+        session.step(23, step, selected_index, &id).unwrap()
+    }
+
+    /// Spellbench launch-benchmark reproduction (Elves, Undercity Arena
+    /// goad): the session offered `include: false` for a goaded attacker,
+    /// which left no legal declaration.
+    #[test]
+    fn session_offers_only_the_inclusion_of_a_goaded_attacker() {
+        let mut state = attacker_state(2);
+        let goaded = state.players[0].battlefield[0];
+        let expires_at_turn = state.turn + 1;
+        state.objects.get_mut(goaded).v4.goaded_by = vec![crate::state::GoadStateV4 {
+            player: PlayerId::P1,
+            expires_at_turn,
+        }];
+        let mut session = session_from_state(state);
+        let response = session.current_response();
+        let RlSessionResponseV1::Decision(decision) = &response else {
+            panic!("expected the goaded attacker's scan step");
+        };
+        assert_eq!((decision.substep_index, decision.substep_count), (0, 2));
+        assert!(matches!(
+            &decision.legal_actions[0].semantic,
+            ActionSemanticV1::ChooseAttackerInclusion { attacker, .. } if attacker.arena_id == goaded.0
+        ));
+        assert_eq!(offered_includes(&response), vec![true]);
+
+        let response = step_include(&mut session, true);
+        assert_eq!(offered_includes(&response), vec![false, true]);
+        step_include(&mut session, false);
+        assert_eq!(session.state.engine.combat.attackers, vec![goaded]);
+    }
+
+    /// A minimum-two attacker: after one blocker is included the last answer
+    /// must include, and after it is declined the last answer must decline.
+    #[test]
+    fn session_offers_only_blocker_answers_that_keep_a_legal_block() {
+        let mut state = blocker_state(2);
+        let attacker = state.engine.combat.attackers[0];
+        state.objects.get_mut(attacker).v4.minimum_blockers_override = Some(2);
+
+        let mut include_first = session_from_state(state.clone());
+        assert_eq!(
+            offered_includes(&include_first.current_response()),
+            vec![false, true]
+        );
+        let response = step_include(&mut include_first, true);
+        assert_eq!(offered_includes(&response), vec![true]);
+        step_include(&mut include_first, true);
+        assert_eq!(include_first.state.engine.combat.blocked_by.len(), 1);
+        assert_eq!(include_first.state.engine.combat.blocked_by[0].1.len(), 2);
+
+        let mut decline_first = session_from_state(state);
+        let response = step_include(&mut decline_first, false);
+        assert_eq!(offered_includes(&response), vec![false]);
+        step_include(&mut decline_first, false);
+        assert!(decline_first.state.engine.combat.blocked_by.is_empty());
+    }
+
+    /// Takes every offered answer of every combat scan step: the offer must be
+    /// exactly the answers with a legal completion (brute force over the
+    /// engine's aggregate validators) and each offered answer is accepted.
+    fn assert_session_offers_exactly_the_completable_answers(
+        session: &RlEpisodeSessionV1,
+        label: &str,
+    ) {
+        if !session.surface.scan_active() {
+            return;
+        }
+        let response = session.current_response();
+        let offered = offered_includes(&response);
+        let completable: Vec<bool> = [false, true]
+            .into_iter()
+            .filter(|include| {
+                crate::policy_surface_v5::scan_answer_has_legal_completion_for_test(
+                    &session.surface,
+                    &session.state,
+                    *include,
+                )
+            })
+            .collect();
+        assert_eq!(offered, completable, "{label}");
+        for index in 0..offered.len() {
+            let mut next = session.clone();
+            let (step, selected_index, id) = action_at(&response, index);
+            next.step(23, step, selected_index, &id)
+                .unwrap_or_else(|error| panic!("{label}: offered answer refused: {error}"));
+            assert_session_offers_exactly_the_completable_answers(&next, label);
+        }
+    }
+
+    #[test]
+    fn session_offers_exactly_the_scan_answers_that_keep_a_legal_completion() {
+        for count in 1..=3 {
+            for goad_mask in 0..(1usize << count) {
+                let mut state = attacker_state(count);
+                let expires_at_turn = state.turn + 1;
+                for index in 0..count {
+                    if goad_mask & (1 << index) != 0 {
+                        let id = state.players[0].battlefield[index];
+                        state.objects.get_mut(id).v4.goaded_by = vec![crate::state::GoadStateV4 {
+                            player: PlayerId::P1,
+                            expires_at_turn,
+                        }];
+                    }
+                }
+                assert_session_offers_exactly_the_completable_answers(
+                    &session_from_state(state),
+                    &format!("attackers count={count} goad_mask={goad_mask:#05b}"),
+                );
+            }
+        }
+        for count in 1..=3 {
+            for minimum in 1..=3u8 {
+                let mut state = blocker_state(count);
+                let attacker = state.engine.combat.attackers[0];
+                state.objects.get_mut(attacker).v4.minimum_blockers_override = Some(minimum);
+                assert_session_offers_exactly_the_completable_answers(
+                    &session_from_state(state),
+                    &format!("blockers count={count} minimum={minimum}"),
+                );
+            }
+        }
+        // H2 removes blockers already assigned to an earlier attacker.
+        for minimum in 1..=3u8 {
+            let mut state = blocker_state(3);
+            let first_attacker = state.engine.combat.attackers[0];
+            let mut second = state.objects.get(first_attacker).clone();
+            second.v4 = ObjectStateV4::from_card_def(second.card_def);
+            second.v4.minimum_blockers_override = Some(minimum);
+            let second_attacker = state.objects.push(second);
+            state.players[0].battlefield.push(second_attacker);
+            state.engine.combat.attackers.push(second_attacker);
+            assert_session_offers_exactly_the_completable_answers(
+                &session_from_state(state),
+                &format!("two attackers, second minimum={minimum}"),
+            );
+        }
+    }
+
+    /// The fast actor still offers the original pair. Declining a goaded
+    /// attacker is rejected before mutation by the same rule the policy
+    /// session filters with, and stays retryable instead of halting the
+    /// episode as an internal apply failure.
+    #[test]
+    fn fast_actor_rejects_declining_a_goaded_attacker_before_mutation() {
+        let mut state = attacker_state(2);
+        let goaded = state.players[0].battlefield[0];
+        let expires_at_turn = state.turn + 1;
+        state.objects.get_mut(goaded).v4.goaded_by = vec![crate::state::GoadStateV4 {
+            player: PlayerId::P1,
+            expires_at_turn,
+        }];
+        let mut session = FastActorSessionV1::reset_with_limits(23, 91, 8, 8);
+        session.state = state;
+        session.surface = PolicySurfaceV5::new();
+        session.environment_revision = 0;
+        session.policy_step_count = 0;
+        session.physical_decision_count = 0;
+        session.current = None;
+        session.terminal = None;
+        session.advance_to_decision_or_terminal();
+        assert_eq!(session.current.as_ref().unwrap().candidates.len(), 2);
+
+        assert_fast_actor_rejection_is_byte_atomic(
+            &mut session,
+            RlSessionErrorCode::StaleEnvironmentBinding,
+            |session| session.step(23, 0, 0),
+        );
+        assert!(session.terminal.is_none());
+        session.step(23, 0, 1).unwrap();
+        session.step(23, 1, 0).unwrap();
+        assert_eq!(session.state.engine.combat.attackers, vec![goaded]);
     }
 
     #[test]

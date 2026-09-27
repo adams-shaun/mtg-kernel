@@ -1854,11 +1854,46 @@ pub fn make_legal_action_v5(
     })
 }
 
+/// The policy surface's original candidates for `decision`: for a combat scan
+/// step, always the `[include: false, include: true]` pair, which remains the
+/// private origin contract. A policy is offered
+/// [`policy_legal_action_candidates_v5`].
 pub fn legal_action_candidates_v5(
     decision: &PolicyDecisionV5,
     state: &GameState,
 ) -> Result<Vec<PolicyLegalActionCandidateV5>> {
-    let core = core_policy_action_candidates_v5(decision, state)?;
+    legal_action_records_v5(core_policy_action_candidates_v5(decision, state)?)
+}
+
+/// The legal actions a policy is offered at `decision`: the original
+/// candidates without any combat scan answer that leaves no legal completion
+/// of the aggregate declaration (declining a goaded attacker, or a block that
+/// can no longer end empty or reach the attacker's minimum). A step whose
+/// other answer is infeasible offers its single legal answer at index 0.
+pub fn policy_legal_action_candidates_v5(
+    decision: &PolicyDecisionV5,
+    surface: &PolicySurfaceV5,
+    state: &GameState,
+) -> Result<Vec<PolicyLegalActionCandidateV5>> {
+    let mut core = core_policy_action_candidates_v5(decision, state)?;
+    if !matches!(decision, PolicyDecisionV5::Surface(_)) {
+        let feasible = surface
+            .feasible_scan_answers(state, decision)
+            .map_err(RlContractError)?;
+        core.retain(|candidate| match candidate.policy_action {
+            PolicyActionV5::ChooseAttackerInclusion { include, .. }
+            | PolicyActionV5::ChooseBlockerInclusion { include, .. } => {
+                feasible[usize::from(include)]
+            }
+            PolicyActionV5::Surface(_) => true,
+        });
+    }
+    legal_action_records_v5(core)
+}
+
+fn legal_action_records_v5(
+    core: Vec<CorePolicyActionCandidateV1>,
+) -> Result<Vec<PolicyLegalActionCandidateV5>> {
     let out = core
         .into_iter()
         .enumerate()
@@ -3647,68 +3682,73 @@ fn validate_episode_decision_payload(
                     )));
                 }
             }
-            if legal_actions.len() != 2 {
-                return Err(RlContractError(format!(
-                    "{context} combat scan must expose exactly two Boolean actions"
-                )));
-            }
             let expected_actor = acting_player;
-            let valid_pair = match policy_context.current_stage {
-                PolicySurfaceStageV5::AttackerInclusion => {
-                    private.attacker.is_none()
-                        && matches!(
-                            &legal_actions[0].semantic,
-                            ActionSemanticV1::ChooseAttackerInclusion {
-                                actor,
-                                attacker,
-                                include: false,
-                            } if *actor == expected_actor
-                                && attacker == &private.current_candidate
-                        )
-                        && matches!(
-                            &legal_actions[1].semantic,
-                            ActionSemanticV1::ChooseAttackerInclusion {
-                                actor,
-                                attacker,
-                                include: true,
-                            } if *actor == expected_actor
-                                && attacker == &private.current_candidate
-                        )
-                }
+            let (context_matches_stage, fixed_attacker) = match policy_context.current_stage {
+                PolicySurfaceStageV5::AttackerInclusion => (private.attacker.is_none(), None),
                 PolicySurfaceStageV5::BlockerInclusion => {
                     let Some(fixed_attacker) = private.attacker.as_ref() else {
                         return Err(RlContractError(format!(
                             "{context} blocker scan is missing its fixed attacker"
                         )));
                     };
-                    matches!(
-                        &legal_actions[0].semantic,
-                        ActionSemanticV1::ChooseBlockerInclusion {
-                            actor,
-                            attacker,
-                            blocker,
-                            include: false,
-                        } if *actor == expected_actor
-                            && attacker == fixed_attacker
-                            && blocker == &private.current_candidate
-                    ) && matches!(
-                        &legal_actions[1].semantic,
-                        ActionSemanticV1::ChooseBlockerInclusion {
-                            actor,
-                            attacker,
-                            blocker,
-                            include: true,
-                        } if *actor == expected_actor
-                            && attacker == fixed_attacker
-                            && blocker == &private.current_candidate
-                    )
+                    (true, Some(fixed_attacker))
                 }
                 PolicySurfaceStageV5::Surface => unreachable!(),
             };
-            if !valid_pair {
-                return Err(RlContractError(format!(
-                    "{context} combat scan actions must be the exact [include:false, include:true] pair bound to the current candidate"
-                )));
+            // Whether `action` answers the current candidate with `include`.
+            let answers = |action: &LegalActionV5, include: bool| {
+                context_matches_stage
+                    && match (&action.semantic, fixed_attacker) {
+                        (
+                            ActionSemanticV1::ChooseAttackerInclusion {
+                                actor,
+                                attacker,
+                                include: answer,
+                            },
+                            None,
+                        ) => {
+                            *actor == expected_actor
+                                && attacker == &private.current_candidate
+                                && *answer == include
+                        }
+                        (
+                            ActionSemanticV1::ChooseBlockerInclusion {
+                                actor,
+                                attacker,
+                                blocker,
+                                include: answer,
+                            },
+                            Some(fixed_attacker),
+                        ) => {
+                            *actor == expected_actor
+                                && attacker == fixed_attacker
+                                && blocker == &private.current_candidate
+                                && *answer == include
+                        }
+                        _ => false,
+                    }
+            };
+            match legal_actions {
+                [exclude, include] => {
+                    if !(answers(exclude, false) && answers(include, true)) {
+                        return Err(RlContractError(format!(
+                            "{context} combat scan actions must be the exact [include:false, include:true] pair bound to the current candidate"
+                        )));
+                    }
+                }
+                // The other answer leaves no legal completion of the declaration.
+                [single] => {
+                    if !(answers(single, false) || answers(single, true)) {
+                        return Err(RlContractError(format!(
+                            "{context} single combat scan action must answer the current candidate"
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(RlContractError(format!(
+                        "{context} combat scan must expose one or two Boolean actions"
+                    )));
+                }
             }
         }
     }
@@ -6596,6 +6636,12 @@ mod policy_v5_artifact_tests {
     }
 
     fn scan_records() -> Vec<PolicyEpisodeRecordV2> {
+        scan_records_with_goaded_first_attacker(false)
+    }
+
+    /// With `goaded_first`, the first scanned attacker is goaded, so its step
+    /// records the single legal answer (include) at index 0.
+    fn scan_records_with_goaded_first_attacker(goaded_first: bool) -> Vec<PolicyEpisodeRecordV2> {
         let mut state = GameState::new_from_libraries(&[], &[], card_name, 77);
         state.step = Step::DeclareAttackers;
         state.active_player = PlayerId::P0;
@@ -6620,6 +6666,15 @@ mod policy_v5_artifact_tests {
             });
             state.players[0].battlefield.push(id);
         }
+        if goaded_first {
+            let goaded = state.players[0].battlefield[0];
+            let expires_at_turn = state.turn + 1;
+            state.objects.get_mut(goaded).v4.goaded_by = vec![crate::state::GoadStateV4 {
+                player: PlayerId::P1,
+                expires_at_turn,
+            }];
+        }
+        let selections: [usize; 3] = if goaded_first { [0, 0, 1] } else { [1, 0, 1] };
         let mut surface = PolicySurfaceV5::new();
         let mut records = vec![PolicyEpisodeRecordV2::Header {
             schema_version: POLICY_EPISODE_SCHEMA_VERSION,
@@ -6633,7 +6688,7 @@ mod policy_v5_artifact_tests {
             episode_key: "test-0".to_string(),
             deck_identifiers: ["Burn".to_string(), "Burn".to_string()],
         }];
-        for (step, selected_index) in [1usize, 0, 1].into_iter().enumerate() {
+        for (step, selected_index) in selections.into_iter().enumerate() {
             let decision = surface.next_decision(&mut state).unwrap();
             let (substep_index, substep_count) = decision.substep();
             let observation = observe_policy_v5(
@@ -6646,7 +6701,20 @@ mod policy_v5_artifact_tests {
                 substep_count,
             )
             .unwrap();
-            let actions = legal_action_candidates_v5(&decision, &state).unwrap();
+            let mut actions = legal_action_candidates_v5(&decision, &state).unwrap();
+            if goaded_first && step == 0 {
+                actions.retain(|action| {
+                    matches!(
+                        action.record.semantic,
+                        ActionSemanticV1::ChooseAttackerInclusion { include: true, .. }
+                    )
+                });
+                for (index, action) in actions.iter_mut().enumerate() {
+                    action.record =
+                        make_legal_action_v5(index as u32, action.record.semantic.clone(), None)
+                            .unwrap();
+                }
+            }
             let selected_action_id = actions[selected_index].record.stable_id.clone();
             records.push(PolicyEpisodeRecordV2::Decision {
                 schema_version: POLICY_EPISODE_SCHEMA_VERSION,
@@ -6803,6 +6871,53 @@ mod policy_v5_artifact_tests {
             .unwrap_err()
             .to_string()
             .contains("exact [include:false, include:true] pair"));
+    }
+
+    /// A scan step whose other answer has no legal completion (here a goaded
+    /// attacker) records a single answer; it must still name the current
+    /// candidate.
+    #[test]
+    fn a_single_forced_scan_answer_validates_only_when_bound_to_the_current_candidate() {
+        let valid = scan_records_with_goaded_first_attacker(true);
+        let PolicyEpisodeRecordV2::Decision { legal_actions, .. } = &valid[1] else {
+            unreachable!()
+        };
+        assert_eq!(legal_actions.len(), 1);
+        validate_policy_episode_records(&valid).unwrap();
+
+        let mut wrong_candidate = valid.clone();
+        let PolicyEpisodeRecordV2::Decision {
+            observation,
+            legal_actions,
+            selected_action_id,
+            ..
+        } = &mut wrong_candidate[1]
+        else {
+            unreachable!()
+        };
+        let other = observation
+            .projection
+            .policy_surface_context
+            .private_combat_selection
+            .as_ref()
+            .unwrap()
+            .remaining_after_current[0]
+            .clone();
+        legal_actions[0] = make_legal_action_v5(
+            0,
+            ActionSemanticV1::ChooseAttackerInclusion {
+                actor: PlayerSeatV1::P0,
+                attacker: other,
+                include: true,
+            },
+            None,
+        )
+        .unwrap();
+        *selected_action_id = legal_actions[0].stable_id.clone();
+        assert!(validate_policy_episode_records(&wrong_candidate)
+            .unwrap_err()
+            .to_string()
+            .contains("single combat scan action must answer the current candidate"));
     }
 
     #[test]
