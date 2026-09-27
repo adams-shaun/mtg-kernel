@@ -1202,6 +1202,16 @@ fn refresh_paid_creature_power_lki(state: &mut GameState, id: ObjectId, from_zon
 /// indexes and `state.stack`, which this function removes it from. Arena ids
 /// are never freed, so snapshots and provenance may still refer to the inert
 /// historical identity without making it a live target.
+///
+/// Also drops every `state.engine.linked_exile_records` row whose exiled
+/// object is `id`. Because the zone marker and zone-change count stay as
+/// recorded, such a row would otherwise still look like a live, uniquely
+/// exiled incarnation: observation fails its uniqueness proof and
+/// `ReturnObjectsExiledBySource` would put the ceased token back onto the
+/// battlefield, which 111.8 forbids. Rows naming `id` only as their source
+/// are kept: a token source ceases only after leaving the battlefield, and
+/// its leaves-the-battlefield return still resolves from the row by source
+/// contract.
 pub fn cease_to_exist(state: &mut GameState, id: ObjectId) -> bool {
     let owner = state.objects.get(id).owner;
     let zone = state.objects.get(id).zone;
@@ -1209,6 +1219,10 @@ pub fn cease_to_exist(state: &mut GameState, id: ObjectId) -> bool {
     if removed {
         state.forget_hand_object(id);
         state.clear_object_relations(id);
+        state
+            .engine
+            .linked_exile_records
+            .retain(|record| record.exiled != id);
     }
     removed
 }
@@ -1447,5 +1461,100 @@ mod tests {
                 remaining: 95,
             }
         );
+    }
+
+    /// Spellbench launch-benchmark reproduction (CawGates): Journey to Nowhere
+    /// exiled a token, the 111.8/704.5d sweep ceased it, and the linked-exile
+    /// record outlived it, so every later observation failed and Journey
+    /// leaving would have returned the ceased token.
+    #[test]
+    fn cease_to_exist_drops_the_linked_exile_record_of_the_ceased_exiled_object() {
+        use crate::state::{AbilitySourceContractV4, LinkedExileRecordV4, ObjectLinkV4};
+
+        let mut state = fresh_state();
+        let source = push_object_into(&mut state, PlayerId::P0, Zone::Battlefield);
+        let exiled = push_object_into(&mut state, PlayerId::P1, Zone::Exile);
+        state.players[0].battlefield.push(source);
+        state.exile.push(exiled);
+        state.objects.get_mut(exiled).v4.exiled_by = Some(ObjectLinkV4 {
+            object: source,
+            zone_change_count: 0,
+        });
+        state.engine.linked_exile_records.push(LinkedExileRecordV4 {
+            source: AbilitySourceContractV4 {
+                source,
+                card_def: 0,
+                owner: PlayerId::P0,
+                controller: PlayerId::P0,
+                zone: Zone::Battlefield,
+                zone_change_count: 0,
+                attached_to: None,
+            },
+            exiled,
+            exiled_card_def: 0,
+            exiled_owner: PlayerId::P1,
+            exiled_zone_change_count: 0,
+        });
+
+        assert!(cease_to_exist(&mut state, exiled));
+        assert!(!state.exile.contains(&exiled));
+        assert_eq!(state.objects.get(exiled).v4.exiled_by, None);
+        assert!(
+            state.engine.linked_exile_records.is_empty(),
+            "a ceased exiled object must not leave a linked-exile record: {:?}",
+            state.engine.linked_exile_records
+        );
+    }
+
+    /// A token source that left the battlefield has already triggered its
+    /// return, which resolves from the row by source contract, so the row
+    /// must survive the source ceasing to exist.
+    #[test]
+    fn cease_to_exist_keeps_the_linked_exile_record_of_a_ceased_token_source() {
+        use crate::state::{AbilitySourceContractV4, LinkedExileRecordV4};
+
+        let mut state = fresh_state();
+        let token_source = push_object_into(&mut state, PlayerId::P0, Zone::Graveyard);
+        state.players[0].graveyard.push(token_source);
+        let still_exiled = push_object_into(&mut state, PlayerId::P1, Zone::Exile);
+        state.exile.push(still_exiled);
+        let record = LinkedExileRecordV4 {
+            source: AbilitySourceContractV4 {
+                source: token_source,
+                card_def: 0,
+                owner: PlayerId::P0,
+                controller: PlayerId::P0,
+                zone: Zone::Battlefield,
+                zone_change_count: 0,
+                attached_to: None,
+            },
+            exiled: still_exiled,
+            exiled_card_def: 0,
+            exiled_owner: PlayerId::P1,
+            exiled_zone_change_count: 0,
+        };
+        state.objects.get_mut(token_source).zone_change_count = 1;
+        state.engine.linked_exile_records.push(record);
+        assert!(cease_to_exist(&mut state, token_source));
+        assert_eq!(state.engine.linked_exile_records, vec![record]);
+    }
+
+    fn push_object_into(state: &mut GameState, owner: PlayerId, zone: Zone) -> ObjectId {
+        state.objects.push(crate::state::GameObject {
+            card_def: 0,
+            name: "fixture".to_string(),
+            owner,
+            controller: owner,
+            zone,
+            tapped: false,
+            summoning_sick: false,
+            damage: 0,
+            counters: Default::default(),
+            attachments: Vec::new(),
+            v4: crate::state::ObjectStateV4::from_card_def(0),
+            spell_copy_origin: None,
+            plotted_turn: None,
+            zone_change_count: 0,
+        })
     }
 }
