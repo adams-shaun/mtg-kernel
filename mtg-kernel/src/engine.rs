@@ -2622,7 +2622,8 @@ fn target_prefix_can_complete(
     target_prefix_can_complete_for_controller(spec, targets_chosen, state.priority_player, state)
 }
 
-pub(crate) fn target_prefix_can_complete_for_controller(
+#[cfg(test)]
+fn target_prefix_can_complete_for_controller(
     spec: TargetSpec,
     targets_chosen: &[Target],
     controller: PlayerId,
@@ -2635,6 +2636,36 @@ pub(crate) fn target_prefix_can_complete_for_controller(
         None,
         state,
     )
+}
+
+/// The source a pending triggered ability targets from: its frozen source
+/// incarnation's definition, exactly as `Decision::ChooseTargets` and
+/// `Action::ChooseTarget` see it.
+fn pending_trigger_targeting_source(pending: &PendingTrigger) -> Option<TargetingSource> {
+    pending.source_contract.map(|contract| TargetingSource {
+        object: pending.source,
+        card_def: contract.card_def,
+    })
+}
+
+/// 603.3d: whether a pending triggered ability's chosen target prefix can
+/// still be completed with targets legal *for its source* (protection from
+/// the source's colour, "other than this", ...). This must be the same
+/// source-aware legality its `Decision::ChooseTargets` offers: a source-less
+/// check kept Journey to Nowhere's trigger when the only creature had
+/// protection from monocolored, and then offered zero legal targets.
+pub(crate) fn pending_trigger_targets_can_complete(
+    pending: &PendingTrigger,
+    state: &GameState,
+) -> bool {
+    pending.target_spec == TargetSpec::None
+        || target_prefix_can_complete_for_controller_and_source(
+            pending.target_spec,
+            &pending.targets,
+            pending.controller,
+            pending_trigger_targeting_source(pending),
+            state,
+        )
 }
 
 fn target_prefix_can_complete_for_controller_and_source(
@@ -2680,6 +2711,7 @@ fn target_prefix_can_complete_for_controller_and_source(
 /// The next legal target choices that still admit a complete mandatory
 /// assignment. Filtering at every prefix prevents a legal first pick from
 /// leading to an empty dependent second-pick decision.
+#[cfg(test)]
 fn completable_next_targets_for(
     spec: TargetSpec,
     targets_chosen: &[Target],
@@ -8141,6 +8173,15 @@ fn drain_pending_triggers_or_decide(state: &mut GameState) -> Option<Decision> {
                 source: pending.source,
             });
         }
+        if !pending_trigger_targets_can_complete(&pending, state) {
+            // 603.3d at the actual placement checkpoint: legality can change
+            // between collection and placement (an earlier trigger in this
+            // batch was just put on the stack), and a trigger whose targets
+            // cannot be completed is removed rather than posing a
+            // `ChooseTargets` with no legal choice.
+            state.engine.pending_triggers.remove(0);
+            continue;
+        }
         let need = target_count(pending.target_spec);
         if pending.targets.len() < usize::from(need) {
             return Some(Decision::ChooseTargets {
@@ -8151,10 +8192,7 @@ fn drain_pending_triggers_or_decide(state: &mut GameState) -> Option<Decision> {
                     pending.target_spec,
                     &pending.targets,
                     pending.controller,
-                    pending.source_contract.map(|contract| TargetingSource {
-                        object: pending.source,
-                        card_def: contract.card_def,
-                    }),
+                    pending_trigger_targeting_source(&pending),
                     state,
                 ),
                 can_finish: pending.targets.len()
@@ -10982,10 +11020,7 @@ fn apply_choose_target(state: &mut GameState, target: Target) -> Result<(), Stri
                 pending.target_spec,
                 &pending.targets,
                 pending.controller,
-                pending.source_contract.map(|contract| TargetingSource {
-                    object: pending.source,
-                    card_def: contract.card_def,
-                }),
+                pending_trigger_targeting_source(&pending),
                 state,
             )
             .contains(&target)
@@ -11165,7 +11200,19 @@ fn apply_choose_optional_activation_target(
             "optional activation targets cannot precede an interactive discard".to_string(),
         );
     }
-    let legal = completable_next_targets_for(pending.target_spec, &pending.targets_chosen, state);
+    // Validate against the same source-aware set the optional-target
+    // decision offered (`drain_pending_activation_or_decide`), not a
+    // source-less one that ignores protection from the source.
+    let ability = card_def::CARD_DEFS
+        .get(state.objects.get(pending.source).card_def as usize)
+        .and_then(|def| def.activated_abilities.get(pending.ability_index as usize))
+        .ok_or("pending activation lost its ability definition")?;
+    let legal = completable_next_activation_targets_for(
+        pending.source,
+        ability,
+        &pending.targets_chosen,
+        state,
+    );
     if !legal.contains(&target) {
         return Err(format!(
             "{target:?} is not a legal optional activation target"
