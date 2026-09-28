@@ -22,9 +22,10 @@ use crate::policy_surface_v5::{
 use crate::rl::{
     build_deck_pair_state, core_policy_action_candidates_v5, legal_action_candidates_v5,
     observe_policy_v5, observe_policy_v5_unhashed_for_flat_policy, parse_strict_json_value,
-    ActionSemanticV1, CardStableRefV1, CorePolicyActionCandidateV1, EpisodeTerminalSummaryV1,
-    LegalActionV5, ObservationV5, PlayerSeatV1, PolicyLegalActionCandidateV5, RlContractError,
-    TargetRefV1, TerminalClassificationV1, TerminalOutcomeV1, TerminalSafeCodeV2,
+    policy_legal_action_candidates_v5, ActionSemanticV1, CardStableRefV1,
+    CorePolicyActionCandidateV1, EpisodeTerminalSummaryV1, LegalActionV5, ObservationV5,
+    PlayerSeatV1, PolicyLegalActionCandidateV5, RlContractError, TargetRefV1,
+    TerminalClassificationV1, TerminalOutcomeV1, TerminalSafeCodeV2,
 };
 use crate::runtime_decks::{runtime_deck_by_id, RuntimeDeckDefinition, RUNTIME_DECKS};
 use crate::state::{Target, Zone};
@@ -3856,6 +3857,16 @@ enum FastActorApplyPathV1 {
     CloneReference,
 }
 
+/// Which answers a session offers at a combat scan step. JSONL sessions keep
+/// the original `[include: false, include: true]` pair, which Python's V5
+/// encoder (`features.py`) requires; in-process sessions offer only the
+/// answers that keep a legal completion of the declaration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanMenuV1 {
+    OriginalPair,
+    LegalAnswersOnly,
+}
+
 #[derive(Clone)]
 pub struct RlEpisodeSessionV1 {
     deck_ids: SessionDeckIdsV1,
@@ -3870,6 +3881,7 @@ pub struct RlEpisodeSessionV1 {
     physical_decision_count: u64,
     current: Option<CurrentDecisionV1>,
     terminal: Option<RlSessionTerminalV1>,
+    scan_menu: ScanMenuV1,
 }
 
 #[derive(Clone)]
@@ -3972,6 +3984,7 @@ impl RlEpisodeSessionV1 {
             max_policy_steps,
             deck_ids,
             None,
+            ScanMenuV1::LegalAnswersOnly,
         )
     }
 
@@ -3982,6 +3995,7 @@ impl RlEpisodeSessionV1 {
         max_policy_steps: u64,
         deck_ids: SessionDeckIdsV1,
         profile: Option<&mut RlPhaseProfileV1>,
+        scan_menu: ScanMenuV1,
     ) -> Result<Self, RlSessionError> {
         Self::reset_with_decks_and_limits_profiled_in_audit_mode(
             episode_id,
@@ -3991,9 +4005,11 @@ impl RlEpisodeSessionV1 {
             deck_ids,
             profile,
             SuppressionAuditMode::Off,
+            scan_menu,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn reset_with_decks_and_limits_profiled_in_audit_mode(
         episode_id: u64,
         env_seed: u64,
@@ -4002,6 +4018,7 @@ impl RlEpisodeSessionV1 {
         deck_ids: SessionDeckIdsV1,
         profile: Option<&mut RlPhaseProfileV1>,
         suppression_audit_mode: SuppressionAuditMode,
+        scan_menu: ScanMenuV1,
     ) -> Result<Self, RlSessionError> {
         Self::reset_with_decks_and_limits_profiled_in_audit_mode_with_randomization(
             episode_id,
@@ -4011,6 +4028,7 @@ impl RlEpisodeSessionV1 {
             deck_ids,
             profile,
             suppression_audit_mode,
+            scan_menu,
         )
     }
 
@@ -4034,6 +4052,7 @@ impl RlEpisodeSessionV1 {
             max_policy_steps,
             deck_ids,
             None,
+            ScanMenuV1::LegalAnswersOnly,
         )
     }
 
@@ -4047,6 +4066,7 @@ impl RlEpisodeSessionV1 {
         max_policy_steps: u64,
         deck_ids: SessionDeckIdsV1,
         profile: Option<&mut RlPhaseProfileV1>,
+        scan_menu: ScanMenuV1,
     ) -> Result<Self, RlSessionError> {
         Self::reset_with_decks_and_limits_profiled_in_audit_mode_with_randomization(
             episode_id,
@@ -4058,9 +4078,11 @@ impl RlEpisodeSessionV1 {
             deck_ids,
             profile,
             SuppressionAuditMode::Off,
+            scan_menu,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn reset_with_decks_and_limits_profiled_in_audit_mode_with_randomization(
         episode_id: u64,
         randomization: ResetRandomization,
@@ -4069,6 +4091,7 @@ impl RlEpisodeSessionV1 {
         deck_ids: SessionDeckIdsV1,
         mut profile: Option<&mut RlPhaseProfileV1>,
         suppression_audit_mode: SuppressionAuditMode,
+        scan_menu: ScanMenuV1,
     ) -> Result<Self, RlSessionError> {
         let mut session = measure_optional(&mut profile, RlPhaseV1::Reset, || {
             // `RlEpisodeSessionV1` does not (yet) expose a starting-player
@@ -4093,6 +4116,7 @@ impl RlEpisodeSessionV1 {
                 physical_decision_count: 0,
                 current: None,
                 terminal: None,
+                scan_menu,
             })
         })?;
         session.advance_to_decision_or_terminal_profiled(profile);
@@ -4292,10 +4316,12 @@ impl RlEpisodeSessionV1 {
                 next_environment_revision,
             )
         })
-        .map_err(|_| {
+        .map_err(|refusal| {
             session_error(
                 RlSessionErrorCode::StaleEnvironmentBinding,
-                "selected action no longer matches the active policy environment",
+                &format!(
+                    "selected action no longer matches the active policy environment: {refusal}"
+                ),
             )
         })?;
         self.current = None;
@@ -4430,22 +4456,26 @@ impl RlEpisodeSessionV1 {
                 return;
             }
         };
-        let candidates = match measure_optional(&mut profile, RlPhaseV1::Actions, || {
-            legal_action_candidates_v5(&surfaced, &self.state)
-        }) {
-            Ok(candidates) => candidates,
-            Err(err) => {
-                self.terminal = Some(halted_terminal(
-                    &self.deck_ids,
-                    self.deck_hashes,
-                    self.episode_id,
-                    format!("fail_closed:{err}"),
-                    self.policy_step_count,
-                    self.physical_decision_count,
-                ));
-                return;
-            }
-        };
+        let candidates =
+            match measure_optional(&mut profile, RlPhaseV1::Actions, || match self.scan_menu {
+                ScanMenuV1::OriginalPair => legal_action_candidates_v5(&surfaced, &self.state),
+                ScanMenuV1::LegalAnswersOnly => {
+                    policy_legal_action_candidates_v5(&surfaced, &self.surface, &self.state)
+                }
+            }) {
+                Ok(candidates) => candidates,
+                Err(err) => {
+                    self.terminal = Some(halted_terminal(
+                        &self.deck_ids,
+                        self.deck_hashes,
+                        self.episode_id,
+                        format!("fail_closed:{err}"),
+                        self.policy_step_count,
+                        self.physical_decision_count,
+                    ));
+                    return;
+                }
+            };
         if candidates.is_empty() {
             self.terminal = Some(halted_terminal(
                 &self.deck_ids,
@@ -6495,6 +6525,7 @@ impl KernelRlJsonlServerV1 {
                     max_policy_steps,
                     deck_ids,
                     profile.as_deref_mut(),
+                    ScanMenuV1::OriginalPair,
                 ) {
                     Ok(session) => session,
                     Err(err) => {
@@ -6597,6 +6628,7 @@ impl KernelRlJsonlServerV1 {
                         max_policy_steps,
                         deck_ids,
                         profile.as_deref_mut(),
+                        ScanMenuV1::OriginalPair,
                     ) {
                         Ok(session) => session,
                         Err(err) => {
@@ -7596,6 +7628,271 @@ mod tests {
         assert!(session.step(23, step, include_index, &include_id).is_ok());
     }
 
+    /// The session error for a refused apply names the refusal instead of
+    /// only the fixed binding text.
+    #[test]
+    fn refused_apply_carries_the_surface_refusal_text() {
+        let mut session = attacker_session(1, 8, 8);
+        let response = session.current_response();
+        let (step, include_index, include_id) = action_at(&response, 1);
+        session.state.players[0].battlefield.clear();
+        let error = session
+            .step(23, step, include_index, &include_id)
+            .unwrap_err();
+        assert_eq!(error.code, RlSessionErrorCode::StaleEnvironmentBinding);
+        assert_eq!(
+            error.message,
+            "selected action no longer matches the active policy environment: \
+             one or more declared attackers is not an eligible attacker"
+        );
+    }
+
+    fn session_from_state(state: GameState) -> RlEpisodeSessionV1 {
+        let mut session = RlEpisodeSessionV1::reset_with_limits(23, 91, 8, 8);
+        session.state = state;
+        session.surface = PolicySurfaceV5::new();
+        session.environment_revision = 0;
+        session.policy_step_count = 0;
+        session.physical_decision_count = 0;
+        session.current = None;
+        session.terminal = None;
+        session.advance_to_decision_or_terminal();
+        session
+    }
+
+    fn goad(state: &mut GameState, attacker: crate::ids::ObjectId) {
+        let expires_at_turn = state.turn + 1;
+        state.objects.get_mut(attacker).v4.goaded_by = vec![crate::state::GoadStateV4 {
+            player: PlayerId::P1,
+            expires_at_turn,
+        }];
+    }
+
+    fn offered_includes(response: &RlSessionResponseV1) -> Vec<bool> {
+        let RlSessionResponseV1::Decision(decision) = response else {
+            panic!("expected decision");
+        };
+        decision
+            .legal_actions
+            .iter()
+            .enumerate()
+            .map(|(index, action)| {
+                assert_eq!(action.selected_index as usize, index);
+                match &action.semantic {
+                    ActionSemanticV1::ChooseAttackerInclusion { include, .. }
+                    | ActionSemanticV1::ChooseBlockerInclusion { include, .. } => *include,
+                    other => panic!("expected a combat scan answer, got {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    fn step_include(session: &mut RlEpisodeSessionV1, include: bool) -> RlSessionResponseV1 {
+        let response = session.current_response();
+        let index = offered_includes(&response)
+            .iter()
+            .position(|offered| *offered == include)
+            .expect("answer is offered");
+        let (step, selected_index, id) = action_at(&response, index);
+        session.step(23, step, selected_index, &id).unwrap()
+    }
+
+    /// Spellbench launch-benchmark reproduction (Elves, Undercity Arena
+    /// goad): the session offered `include: false` for a goaded attacker,
+    /// which left no legal declaration.
+    #[test]
+    fn session_offers_only_the_inclusion_of_a_goaded_attacker() {
+        let mut state = attacker_state(2);
+        let goaded = state.players[0].battlefield[0];
+        goad(&mut state, goaded);
+        let mut session = session_from_state(state);
+        let response = session.current_response();
+        let RlSessionResponseV1::Decision(decision) = &response else {
+            panic!("expected the goaded attacker's scan step");
+        };
+        assert_eq!((decision.substep_index, decision.substep_count), (0, 2));
+        assert!(matches!(
+            &decision.legal_actions[0].semantic,
+            ActionSemanticV1::ChooseAttackerInclusion { attacker, .. } if attacker.arena_id == goaded.0
+        ));
+        assert_eq!(offered_includes(&response), vec![true]);
+
+        let response = step_include(&mut session, true);
+        assert_eq!(offered_includes(&response), vec![false, true]);
+        step_include(&mut session, false);
+        assert_eq!(session.state.engine.combat.attackers, vec![goaded]);
+    }
+
+    /// A minimum-two attacker: after one blocker is included the last answer
+    /// must include, and after it is declined the last answer must decline.
+    #[test]
+    fn session_offers_only_blocker_answers_that_keep_a_legal_block() {
+        let mut state = blocker_state(2);
+        let attacker = state.engine.combat.attackers[0];
+        state.objects.get_mut(attacker).v4.minimum_blockers_override = Some(2);
+
+        let mut include_first = session_from_state(state.clone());
+        assert_eq!(
+            offered_includes(&include_first.current_response()),
+            vec![false, true]
+        );
+        let response = step_include(&mut include_first, true);
+        assert_eq!(offered_includes(&response), vec![true]);
+        step_include(&mut include_first, true);
+        assert_eq!(include_first.state.engine.combat.blocked_by.len(), 1);
+        assert_eq!(include_first.state.engine.combat.blocked_by[0].1.len(), 2);
+
+        let mut decline_first = session_from_state(state);
+        let response = step_include(&mut decline_first, false);
+        assert_eq!(offered_includes(&response), vec![false]);
+        step_include(&mut decline_first, false);
+        assert!(decline_first.state.engine.combat.blocked_by.is_empty());
+    }
+
+    /// Takes every offered answer of every combat scan step: the offer must be
+    /// exactly the answers with a legal completion (brute force over the
+    /// engine's aggregate validators) and each offered answer is accepted.
+    fn assert_session_offers_exactly_the_completable_answers(
+        session: &RlEpisodeSessionV1,
+        label: &str,
+    ) {
+        if !session.surface.scan_active() {
+            return;
+        }
+        let response = session.current_response();
+        let offered = offered_includes(&response);
+        let completable: Vec<bool> = [false, true]
+            .into_iter()
+            .filter(|include| {
+                crate::policy_surface_v5::scan_answer_has_legal_completion_for_test(
+                    &session.surface,
+                    &session.state,
+                    *include,
+                )
+            })
+            .collect();
+        assert_eq!(offered, completable, "{label}");
+        for index in 0..offered.len() {
+            let mut next = session.clone();
+            let (step, selected_index, id) = action_at(&response, index);
+            next.step(23, step, selected_index, &id)
+                .unwrap_or_else(|error| panic!("{label}: offered answer refused: {error}"));
+            assert_session_offers_exactly_the_completable_answers(&next, label);
+        }
+    }
+
+    #[test]
+    fn session_offers_exactly_the_scan_answers_that_keep_a_legal_completion() {
+        for count in 1..=3 {
+            for goad_mask in 0..(1usize << count) {
+                let mut state = attacker_state(count);
+                for index in 0..count {
+                    if goad_mask & (1 << index) != 0 {
+                        let id = state.players[0].battlefield[index];
+                        goad(&mut state, id);
+                    }
+                }
+                assert_session_offers_exactly_the_completable_answers(
+                    &session_from_state(state),
+                    &format!("attackers count={count} goad_mask={goad_mask:#05b}"),
+                );
+            }
+        }
+        for count in 1..=3 {
+            for minimum in 1..=3u8 {
+                let mut state = blocker_state(count);
+                let attacker = state.engine.combat.attackers[0];
+                state.objects.get_mut(attacker).v4.minimum_blockers_override = Some(minimum);
+                assert_session_offers_exactly_the_completable_answers(
+                    &session_from_state(state),
+                    &format!("blockers count={count} minimum={minimum}"),
+                );
+            }
+        }
+        // H2 removes blockers already assigned to an earlier attacker.
+        for minimum in 1..=3u8 {
+            let mut state = blocker_state(3);
+            let first_attacker = state.engine.combat.attackers[0];
+            let mut second = state.objects.get(first_attacker).clone();
+            second.v4 = ObjectStateV4::from_card_def(second.card_def);
+            second.v4.minimum_blockers_override = Some(minimum);
+            let second_attacker = state.objects.push(second);
+            state.players[0].battlefield.push(second_attacker);
+            state.engine.combat.attackers.push(second_attacker);
+            assert_session_offers_exactly_the_completable_answers(
+                &session_from_state(state),
+                &format!("two attackers, second minimum={minimum}"),
+            );
+        }
+    }
+
+    /// Python's V5 encoder (`features.py`) requires both answers at every
+    /// combat scan step, so sessions reset through the JSONL wire keep the
+    /// original pair even where one answer would strand the scan. The surface
+    /// still refuses that answer, with the engine's text, if it is picked.
+    #[test]
+    fn jsonl_sessions_keep_the_original_scan_pair_for_the_python_v5_encoder() {
+        for reset in [v5_reset_line("r5", 91, 8), v6_reset_line("r6", 91, 8)] {
+            let mut server = KernelRlJsonlServerV1::new();
+            server.handle_line(&reset);
+            let session = &mut server.active.as_mut().expect("active session").session;
+            let mut state = attacker_state(2);
+            let goaded = state.players[0].battlefield[0];
+            goad(&mut state, goaded);
+            session.state = state;
+            session.surface = PolicySurfaceV5::new_for_session();
+            session.environment_revision = 0;
+            session.policy_step_count = 0;
+            session.physical_decision_count = 0;
+            session.current = None;
+            session.terminal = None;
+            session.advance_to_decision_or_terminal();
+
+            let response = session.current_response();
+            assert_eq!(offered_includes(&response), vec![false, true]);
+            let (step, index, id) = action_at(&response, 0);
+            let error = session.step(1, step, index, &id).unwrap_err();
+            assert_eq!(
+                error.message,
+                "selected action no longer matches the active policy environment: \
+                 one or more goaded creatures able to attack was omitted"
+            );
+            let (step, index, id) = action_at(&response, 1);
+            session.step(1, step, index, &id).unwrap();
+        }
+    }
+
+    /// The fast actor still offers the original pair. Declining a goaded
+    /// attacker is rejected before mutation by the same rule the policy
+    /// session filters with, and stays retryable instead of halting the
+    /// episode as an internal apply failure.
+    #[test]
+    fn fast_actor_rejects_declining_a_goaded_attacker_before_mutation() {
+        let mut state = attacker_state(2);
+        let goaded = state.players[0].battlefield[0];
+        goad(&mut state, goaded);
+        let mut session = FastActorSessionV1::reset_with_limits(23, 91, 8, 8);
+        session.state = state;
+        session.surface = PolicySurfaceV5::new();
+        session.environment_revision = 0;
+        session.policy_step_count = 0;
+        session.physical_decision_count = 0;
+        session.current = None;
+        session.terminal = None;
+        session.advance_to_decision_or_terminal();
+        assert_eq!(session.current.as_ref().unwrap().candidates.len(), 2);
+
+        assert_fast_actor_rejection_is_byte_atomic(
+            &mut session,
+            RlSessionErrorCode::StaleEnvironmentBinding,
+            |session| session.step(23, 0, 0),
+        );
+        assert!(session.terminal.is_none());
+        session.step(23, 0, 1).unwrap();
+        session.step(23, 1, 0).unwrap();
+        assert_eq!(session.state.engine.combat.attackers, vec![goaded]);
+    }
+
     #[test]
     fn fast_actor_cap_snapshot_retry_overflow_and_final_commit_are_fail_closed() {
         let full_below = attacker_session(3, 8, 2);
@@ -8043,6 +8340,10 @@ mod tests {
         assert_eq!(test_policy_v5_materialization_calls(), (0, 1));
     }
 
+    /// Full and fast sessions offer equal candidates only where no combat scan
+    /// answer is filtered: the in-process full session drops answers without a
+    /// legal completion (goad, blocker minimums), the fast actor keeps the
+    /// original pair. Burn and Rally have neither.
     fn prove_fast_actor_parity(deck_id: &str, seed: u64) {
         let episode_id = seed ^ 0xFA57_AC70_0000_0001;
         let deck_ids = [deck_id.to_string(), deck_id.to_string()];
@@ -8264,6 +8565,7 @@ mod tests {
             [deck_id.to_string(), deck_id.to_string()],
             None,
             mode,
+            ScanMenuV1::LegalAnswersOnly,
         )
         .unwrap()
     }
