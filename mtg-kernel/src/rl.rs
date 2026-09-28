@@ -5761,14 +5761,17 @@ fn pending_discard_semantic_v2(
     engine::validate_pending_discard_binding(state, p)
         .map_err(|(_, error)| RlContractError(format!("invalid pending discard: {error}")))?;
     let (resume_stage, resume_source) = match &p.resume {
-        engine::DiscardResume::None => (DiscardResumeSemanticV2::None, None),
+        // The resolving ability itself stays on the public stack.
+        engine::DiscardResume::None | engine::DiscardResume::FinishAbilityResolution { .. } => {
+            (DiscardResumeSemanticV2::None, None)
+        }
         engine::DiscardResume::FinishCast { .. } => (DiscardResumeSemanticV2::FinishCast, None),
         engine::DiscardResume::FinishActivation { .. } => {
             (DiscardResumeSemanticV2::FinishActivation, None)
         }
-        // These sources were public stack objects before resolution popped
-        // them. The choice remains inside that uninterrupted resolution, so
-        // preserve the historical public incarnation while it is detached.
+        // These sources are the spell still resolving on the stack (608.2);
+        // the choice remains inside that uninterrupted resolution, so they
+        // keep the spell's public stack incarnation.
         engine::DiscardResume::FinishSpellResolution { source, .. } => (
             DiscardResumeSemanticV2::FinishSpellResolution,
             Some(detached_resolving_source_ref(

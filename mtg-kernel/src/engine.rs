@@ -815,6 +815,13 @@ pub enum DiscardResume {
         then: Box<EffectOp>,
         spell_resume: Option<(ObjectId, Zone)>,
     },
+    /// A resolving triggered or activated ability whose last instruction
+    /// is a discard (Harrier Strix's loot, Moon-Circuit Hacker's and
+    /// Refurbished Familiar's triggers, The Modern Age's chapter). 608.2:
+    /// the ability is still resolving, and stays on the stack, until the
+    /// discard is chosen; `apply_discard` then removes this exact stack
+    /// item. Appended after every earlier variant.
+    FinishAbilityResolution { stack_item_id: StackItemId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -5910,6 +5917,20 @@ pub(crate) fn validate_pending_discard_binding(
             }
             Ok(())
         }
+        DiscardResume::FinishAbilityResolution { stack_item_id } => {
+            let resolving = state
+                .stack
+                .iter()
+                .filter(|item| item.v4.stack_item_id == *stack_item_id)
+                .collect::<Vec<_>>();
+            match resolving.as_slice() {
+                [item] if item.kind != StackItemKind::Spell => Ok(()),
+                _ => Err((
+                    state.stack.last().map_or(ObjectId(0), |item| item.source),
+                    "ability discard lost its resolving stack item".to_string(),
+                )),
+            }
+        }
         DiscardResume::None
         | DiscardResume::FinishSpellResolution { .. }
         | DiscardResume::FinishOptionalCost { .. } => Ok(()),
@@ -6043,6 +6064,13 @@ fn apply_discard(state: &mut GameState, chosen: Vec<ObjectId>, pending_discard: 
     }
     match pending_discard.resume {
         DiscardResume::None => collect_and_queue_triggers(state),
+        DiscardResume::FinishAbilityResolution { stack_item_id } => {
+            // The ability's resolution is over only now (608.2).
+            state
+                .stack
+                .retain(|item| item.v4.stack_item_id != stack_item_id);
+            collect_and_queue_triggers(state);
+        }
         DiscardResume::FinishCast { .. } => {
             let (pending, cast_method) =
                 owned_cast.expect("validated FinishCast owns its removed pending cast");
@@ -6301,6 +6329,7 @@ fn drain_pending_effect_or_decide(state: &mut GameState) -> Option<Decision> {
                     Some((UnsupportedMechanic::InvalidEffectContinuation, item.source));
                 return None;
             }
+            keep_ability_on_stack_until_discarded(state, &item);
             collect_and_queue_triggers(state);
             reset_priority(state);
         }
@@ -9285,6 +9314,42 @@ fn execute_resolving_program(
     }
 }
 
+/// 608.2: a triggered or activated ability whose program ended by staging
+/// a discard (`EffectOp::DiscardCards` returns before the discard is
+/// chosen) is still resolving. Keep it on the stack, bound to the pending
+/// discard, until `apply_discard` removes it. Returns whether it was kept.
+fn keep_ability_on_stack_until_discarded(state: &mut GameState, item: &StackItem) -> bool {
+    if item.kind == StackItemKind::Spell {
+        return false;
+    }
+    let Some(pending) = state.engine.pending_discard.as_mut() else {
+        return false;
+    };
+    if pending.resume != DiscardResume::None {
+        return false;
+    }
+    pending.resume = DiscardResume::FinishAbilityResolution {
+        stack_item_id: item.v4.stack_item_id,
+    };
+    state.stack.push(item.clone());
+    true
+}
+
+/// 608.2 / 608.2n: a spell whose resolution waits on a player's choice (its
+/// own discard, or a "you may pay" cost) is still resolving and stays on
+/// the stack until the deferred move to its post-resolution zone, which
+/// removes it from `state.stack` with the rest of the zone change
+/// (`event::remove_from_zone`). Putting the popped item back keeps the card
+/// in exactly one public zone throughout the choice, as the resumable
+/// `pending_effect` and `pending_spell_copy` paths already do.
+fn keep_spell_on_stack_until_resolved(state: &mut GameState, item: StackItem) {
+    // The zone change matches the stack entry through its source contract;
+    // without one it could never be removed, so leave such an item off.
+    if item.v4.source_contract.is_some() {
+        state.stack.push(item);
+    }
+}
+
 fn resolve_top_of_stack(state: &mut GameState) -> ResolutionProgress {
     let item = state
         .stack
@@ -9360,7 +9425,11 @@ fn resolve_top_of_stack(state: &mut GameState) -> ResolutionProgress {
     }
 
     if let Some(effect) = item.inline_effect.clone() {
-        return execute_resolving_program(state, &item, &ctx, &effect);
+        let progress = execute_resolving_program(state, &item, &ctx, &effect);
+        if progress == ResolutionProgress::Complete {
+            keep_ability_on_stack_until_discarded(state, &item);
+        }
+        return progress;
     }
 
     let card_def_idx = state.objects.get(item.source).card_def;
@@ -9448,6 +9517,7 @@ fn resolve_top_of_stack(state: &mut GameState) -> ResolutionProgress {
                 source: item.source,
                 to_zone,
             };
+            keep_spell_on_stack_until_resolved(state, item);
         } else if let Some(poc) = state.engine.pending_optional_cost.as_mut() {
             // Same 608.2m deferral, one layer further out: the effect
             // resolved into `EffectOp::MayPayCostThen` (Highway Robbery:
@@ -9464,6 +9534,7 @@ fn resolve_top_of_stack(state: &mut GameState) -> ResolutionProgress {
             // `PendingOptionalCost::spell_resume`'s doc for where the
             // deferred move actually happens once that's all done.
             poc.spell_resume = Some((item.source, to_zone));
+            keep_spell_on_stack_until_resolved(state, item);
         } else {
             if finish_resolved_stack_item(state, &item).is_err() {
                 state.engine.halted =
