@@ -10330,11 +10330,25 @@ pub(crate) fn put_ninjutsu_source_onto_battlefield_attacking(
     {
         return Ok(());
     }
+    // The source is in hand, so any combat entry naming its id belongs to an
+    // earlier battlefield incarnation that was removed from combat when it
+    // left (506.4) -- e.g. the attacker an earlier ninjutsu returned this
+    // same combat, whose own ninjutsu is resolving now. That stale id is not
+    // this object: the permanent entering here is a new object (400.7) that
+    // is attacking and unblocked (702.49c). Drop the stale entries instead
+    // of treating them as "already attacking", which halted the game.
+    state
+        .engine
+        .combat
+        .attackers
+        .retain(|&attacker| attacker != source);
+    state
+        .engine
+        .combat
+        .blocked_by
+        .retain(|(attacker, _)| *attacker != source);
     event::propose_and_commit(state, ProposedEvent::zone_change(source, Zone::Battlefield));
     state.objects.get_mut(source).tapped = true;
-    if state.engine.combat.attackers.contains(&source) {
-        return Err("ninjutsu source already appears in combat".to_string());
-    }
     state.engine.combat.attackers.push(source);
     Ok(())
 }
