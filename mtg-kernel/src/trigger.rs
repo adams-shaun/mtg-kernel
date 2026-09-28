@@ -1810,16 +1810,14 @@ fn trigger_matches(
             if *object != source {
                 return false;
             }
-            let subtype_id = subtype.stable_id();
             let count = state.players[controller.index()]
                 .battlefield
                 .iter()
                 .copied()
                 .filter(|candidate| *candidate != source)
                 .filter(|candidate| {
-                    crate::engine::effective_subtype_ids(state, *candidate)
-                        .binary_search(&subtype_id)
-                        .is_ok()
+                    subtype
+                        .is_in_subtype_ids(&crate::engine::effective_subtype_ids(state, *candidate))
                 })
                 .count();
             count >= usize::from(minimum_count)
@@ -1890,9 +1888,7 @@ fn trigger_matches(
         ) => {
             *object != source
                 && *controller_before == controller
-                && effective_subtype_ids_before
-                    .binary_search(&subtype.stable_id())
-                    .is_ok()
+                && subtype.is_in_subtype_ids(effective_subtype_ids_before)
         }
         _ => false,
     }
