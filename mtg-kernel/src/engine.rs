@@ -2775,6 +2775,22 @@ fn activation_legal_targets_for(
     targets_chosen: &[Target],
     state: &GameState,
 ) -> Vec<Target> {
+    activation_legal_targets_with_source_lki(source, ability, targets_chosen, false, state)
+}
+
+/// `source_departed`: the ability's source has left the battlefield since
+/// activation (Tinder Wall sacrifices itself as a cost). Its combat relation
+/// is then read from last known information (608.2b, 113.7a): the target was
+/// checked to be a creature it blocked at activation, and a blocker stops
+/// blocking only by being removed from combat, which here happened when it
+/// left (506.4), so the relation as it last existed still holds.
+fn activation_legal_targets_with_source_lki(
+    source: ObjectId,
+    ability: &ActivatedAbilityDef,
+    targets_chosen: &[Target],
+    source_departed: bool,
+    state: &GameState,
+) -> Vec<Target> {
     let controller = state.objects.get(source).controller;
     legal_targets_for_controller_from_source(
         ability.target_spec,
@@ -2793,14 +2809,15 @@ fn activation_legal_targets_for(
             let Target::Object(attacker) = target else {
                 return false;
             };
-            state
-                .engine
-                .combat
-                .blocked_by
-                .iter()
-                .any(|(candidate_attacker, blockers)| {
-                    candidate_attacker == attacker && blockers.contains(&source)
-                })
+            source_departed
+                || state
+                    .engine
+                    .combat
+                    .blocked_by
+                    .iter()
+                    .any(|(candidate_attacker, blockers)| {
+                        candidate_attacker == attacker && blockers.contains(&source)
+                    })
         }
     })
     .collect()
@@ -9063,7 +9080,18 @@ fn stack_targets_still_legal(item: &StackItem, state: &GameState) -> Result<bool
                     .activated_abilities
                     .get(ability_index as usize)
                     .ok_or("activated stack item carries an out-of-range ability index")?;
-                activation_legal_targets_for(item.source, ability, &chosen, state).contains(&target)
+                let source_departed = state.objects.try_get(item.source).is_none_or(|live| {
+                    live.zone_change_count != source_contract.zone_change_count
+                        || live.zone != source_contract.zone
+                });
+                activation_legal_targets_with_source_lki(
+                    item.source,
+                    ability,
+                    &chosen,
+                    source_departed,
+                    state,
+                )
+                .contains(&target)
             }
             _ => legal_targets_for_controller_from_source(
                 spec,
