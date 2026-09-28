@@ -920,8 +920,11 @@ pub enum OptionalCostChoice {
     SacrificeLand,
 }
 
-/// This turn's combat. Reset at every `Step::BeginCombat`. An attacker
-/// with no entry in `blocked_by` is unblocked.
+/// This turn's combat. Reset at every `Step::BeginCombat` and again as the
+/// end of combat step ends (511.3: every creature is removed from combat
+/// then). An attacker with no entry in `blocked_by` is unblocked; one whose
+/// entry lists no blockers stays blocked (509.1h). A permanent leaves these
+/// lists the moment it leaves the battlefield (`remove_from_combat`, 506.4).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CombatState {
     pub attackers_declared: bool,
@@ -937,6 +940,22 @@ pub struct CombatState {
     /// This is reference-AI behavior, not a rules-level ordering guarantee;
     /// a future surface can carry an explicit damage allocation instead.
     pub blocked_by: Vec<(ObjectId, Vec<ObjectId>)>,
+}
+
+impl CombatState {
+    /// 506.4: a permanent that leaves the battlefield is removed from
+    /// combat. It stops being an attacking or blocking creature, so its id
+    /// (which the object arena reuses for the card's later incarnations,
+    /// 400.7) must not keep it in combat if the card returns. A blocked
+    /// attacker keeps its (possibly now empty) blocker list: it remains
+    /// blocked even if every creature blocking it is removed (509.1h).
+    pub(crate) fn remove_from_combat(&mut self, id: ObjectId) {
+        self.attackers.retain(|&attacker| attacker != id);
+        self.blocked_by.retain(|(attacker, _)| *attacker != id);
+        for (_, blockers) in &mut self.blocked_by {
+            blockers.retain(|&blocker| blocker != id);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -9517,6 +9536,12 @@ fn advance_step(state: &mut GameState) {
             .all(|&id| !is_still_in_combat(state, id))
     {
         next = Step::EndCombat;
+    }
+    // 511.3: as the end of combat step ends, every creature is removed from
+    // combat. Without this the record of this combat's attackers and
+    // blockers survived into the second main phase and the next turn.
+    if state.step == Step::EndCombat {
+        state.engine.combat = CombatState::default();
     }
 
     state.step = next;
