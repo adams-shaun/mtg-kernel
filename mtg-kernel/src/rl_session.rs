@@ -1140,6 +1140,9 @@ fn flat_stack_action_object_ordinal_v1(
 
     match (stack_ordinal, detached_matches) {
         (Some(ordinal), 0) => Ok(ordinal),
+        // 608.2: a spell whose optional cost suspends its resolution stays
+        // on the stack, as its top item, until the deferred zone change.
+        (Some(ordinal), 1) if ordinal + 1 == state.stack.len() => Ok(ordinal),
         (None, 1) => {
             let appears_in_an_ordinary_zone =
                 [PlayerId::P0, PlayerId::P1].into_iter().any(|player| {
