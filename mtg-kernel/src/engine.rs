@@ -2530,26 +2530,15 @@ fn legal_targets_for_controller_from_source(
         .map(Target::Object)
         .collect(),
         TargetSpec::SpellManaValueAtMostControlledSubtypes { first, second } => {
-            let first = first.stable_id();
-            let second = second.map(card_def::Subtype::stable_id);
             let controlled_count = state
                 .objects
                 .iter()
                 .filter(|(_, object)| {
+                    let ids = &object.v4.effective_subtype_ids;
                     object.zone == Zone::Battlefield
                         && object.controller == controller
-                        && (object
-                            .v4
-                            .effective_subtype_ids
-                            .binary_search(&first)
-                            .is_ok()
-                            || second.is_some_and(|second| {
-                                object
-                                    .v4
-                                    .effective_subtype_ids
-                                    .binary_search(&second)
-                                    .is_ok()
-                            }))
+                        && (first.is_in_subtype_ids(ids)
+                            || second.is_some_and(|second| second.is_in_subtype_ids(ids)))
                 })
                 .count() as u16;
             let announcing = state
@@ -7997,11 +7986,7 @@ pub(crate) fn validate_pending_activation(
                 || tap_cost_subtype.is_some_and(|subtype| {
                     binding.object != pending.source
                         && !live.tapped
-                        && live
-                            .v4
-                            .effective_subtype_ids
-                            .binary_search(&subtype.stable_id())
-                            .is_ok()
+                        && subtype.is_in_subtype_ids(&live.v4.effective_subtype_ids)
                         && payable_activation_cost_object_candidates(
                             pending.controller,
                             pending.source,
@@ -10241,16 +10226,14 @@ pub fn has_effective_subtype(state: &GameState, id: ObjectId, subtype: card_def:
     let Some(object) = state.objects.try_get(id) else {
         return false;
     };
-    if object
-        .v4
-        .effective_subtype_ids
-        .binary_search(&subtype.stable_id())
-        .is_ok()
-    {
+    if subtype.is_in_subtype_ids(&object.v4.effective_subtype_ids) {
         return true;
     }
-    attached_equipment_profiles(state, id)
-        .any(|(_, equipment)| equipment.add_subtype == Some(subtype))
+    attached_equipment_profiles(state, id).any(|(_, equipment)| {
+        equipment
+            .add_subtype
+            .is_some_and(|added| added.same_subtype_as(subtype))
+    })
 }
 
 fn participates_in_wave(state: &GameState, id: ObjectId, first_strike_wave: bool) -> bool {
