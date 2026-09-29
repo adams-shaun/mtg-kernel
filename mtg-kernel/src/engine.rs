@@ -10498,15 +10498,22 @@ pub(crate) fn put_ninjutsu_source_onto_battlefield_attacking(
     Ok(())
 }
 
-/// 510.1c, no-trample simplification: lethal damage (toughness minus
+/// 510.1c assignment among blockers: lethal damage (toughness minus
 /// damage already marked) goes to each blocker in `blockers`' order
-/// except the last, which absorbs whatever power remains (there being no
-/// trample in this pool, that's the only legal recipient once the
-/// attacker itself has already been assigned to blockers rather than the
-/// player). A single blocker just gets it all directly. The order itself
-/// is `CombatState::blocked_by`'s fixed deterministic sort -- see that
-/// field's doc for why this is a stubbed decision point, not a real one,
-/// this increment.
+/// except the last, which absorbs whatever power remains. A single
+/// blocker just gets it all directly.
+///
+/// Known gap (pool-reachable): CR 702.19 trample is not implemented,
+/// though this pool grants TRAMPLE to Spinewoods Paladin and Avenging
+/// Hunter. Excess power is never assigned to the defending player once
+/// the attacker is blocked, and under CR 702.19d a trampler whose
+/// blockers have all left the battlefield by damage assignment should
+/// assign all its damage to the defending player; here an empty
+/// `blockers` list produces no events at all.
+///
+/// The order itself is `CombatState::blocked_by`'s fixed deterministic
+/// sort -- see that field's doc for why this is a stubbed decision
+/// point, not a real one, this increment.
 fn assign_attacker_damage_to_blockers(
     state: &GameState,
     attacker: ObjectId,
