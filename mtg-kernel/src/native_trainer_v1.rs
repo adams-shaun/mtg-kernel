@@ -4702,18 +4702,24 @@ mod tests {
             // verification gate (rally_mirror_v2 + burn_mirror_v6) that
             // runs after this round, since it is a genuine numerical
             // (not just structural) result.
+            //
+            // Re-baselined a second time for PR #111's CR 608.2 / 511.3
+            // rules fixes (a resolving spell stays on the stack during its
+            // choices; the combat record clears as the end of combat step
+            // ends): same observation-derived rationale, values read from
+            // this test's failing run on this target.
             (
                 "x86_64-pc-windows-msvc",
                 BurnPairNumericalWitnessV1 {
                     train_state_sha256: [
-                        55, 212, 85, 76, 98, 50, 182, 141, 225, 231, 66, 98, 154, 58, 94, 178, 108,
-                        164, 50, 190, 62, 32, 102, 182, 143, 237, 199, 75, 14, 178, 180, 35,
+                        75, 76, 94, 82, 199, 76, 132, 26, 214, 217, 190, 86, 137, 208, 249, 45,
+                        167, 36, 95, 135, 107, 8, 204, 25, 210, 1, 106, 193, 17, 172, 99, 203,
                     ],
                     model_digest_after:
-                        "d120d07dffda68bd7a207eaa9172ca2762ddad936c9d8bf56122584ee261e9c0",
-                    policy_sum_bits: 1_111_823_260,
-                    value_sum_bits: 1_121_905_000,
-                    loss_bits: 1_064_304_203,
+                        "f7f0b6c48de0df54a3bff46e61642f1501128b5565e5b4b0f08be3e3ff1634a0",
+                    policy_sum_bits: 1_111_590_204,
+                    value_sum_bits: 1_121_796_090,
+                    loss_bits: 1_064_108_794,
                 },
             )
         }

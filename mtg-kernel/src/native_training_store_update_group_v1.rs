@@ -5322,13 +5322,21 @@ mod tests {
         // `recorded_burn_pair_numerical_witness_v1` (native_trainer_v1.rs)
         // already is. The linux-gnu delta below is the accepted epoch
         // re-baseline, replay-verified (40/40, zero divergence).
+        //
+        // Re-baselined again for PR #111's CR 608.2 / 511.3 rules fixes: the
+        // observation content those fixes deliberately changed (a resolving
+        // spell on the stack during its choices; no stale combat record)
+        // moves both the byte length and the digest. Values are read from
+        // this test's failing run on x86_64-pc-windows-msvc; the linux-gnu
+        // arm below predates this branch and was already stale on
+        // x86_64-unknown-linux-gnu main, so it still needs a linux-gnu run.
         #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         const MAIN_GOLDEN_SHA256_V1: &str =
             "befacadb1ed7cc774587779c087bcd6c429d83fc500ca1744d01b685e1300ddc";
         #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         const MAIN_GOLDEN_SHA256_V1: &str =
-            "73e1af55771e8b8876fba629a21dafb0f8d657e04ab3f790465db60e6ddb8ec8";
-        const MAIN_GOLDEN_LEN_V1: usize = 78_190;
+            "ada351f494793226c55f80e585956895cb966e81e7e1241b5d9793463e93f5fe";
+        const MAIN_GOLDEN_LEN_V1: usize = 71_544;
 
         let run_bytes = test_fixture_bytes_v2();
         let run = decode_train_run_v2(&run_bytes).unwrap();
@@ -5811,6 +5819,12 @@ mod tests {
         // same class of literal but could not be verified or re-baselined
         // from this Windows host; it needs the identical treatment on a
         // Linux target before this test is fully current there.
+        //
+        // Re-baselined again for PR #111's CR 608.2 / 511.3 rules fixes: the
+        // deck-binding and trajectory-digest fields this pin covers embed the
+        // observations those fixes changed. Value read from this test's
+        // failing run on x86_64-pc-windows-msvc (the projection is
+        // float-free, so it stays platform-independent).
         let value: Value = serde_json::from_slice(group.canonical_bytes()).unwrap();
         let episodes_cj =
             to_canonical_json_bytes_v1(&value["evidence"]["episodes"], episode_null_policy_v1())
@@ -5818,7 +5832,7 @@ mod tests {
         let episodes_sha256: [u8; 32] = Sha256::digest(&episodes_cj).into();
         assert_eq!(
             lower_hex_raw32_v1(episodes_sha256),
-            "2002effe9f1cc7a88d896dffeacb157cab00201a9c401ca9530c1b3338cc1372",
+            "21aeea0b30cad362f7c0ff6e3e23bfe62bc04a361f2acc1220252f0f4a749a13",
             "the legacy episode projection drifted from the pre-C2 baseline"
         );
     }
