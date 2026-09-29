@@ -6732,6 +6732,38 @@ mod tests {
         );
     }
 
+    /// CURRENT_V2-pin tripwire, same discipline as
+    /// `tensorizer_current_triple_is_not_silently_overwritten_in_place`: the
+    /// three literals below are typed independently of the constants' own
+    /// definitions, so this cannot pass by self-reference. CURRENT_V2 was
+    /// added beside CURRENT_V1 when the CR 608.2 / 511.3 rules fixes moved
+    /// the regenerated golden (the source hash matches V1's because
+    /// features.py did not change), and the maintainer ratified the profile
+    /// on PR #111. A future regeneration must add a fourth
+    /// tensorizer-authority triple alongside these, never overwrite V2 in
+    /// place.
+    #[test]
+    fn tensorizer_current_v2_triple_is_not_silently_overwritten_in_place() {
+        assert_eq!(
+            FROZEN_TENSORIZER_AUTHORITY_SOURCE_SHA256_CURRENT_V2,
+            "5d82f5b87a6819076c903390230015da456f914828890d9c5384af410f21be1c",
+            "FROZEN_TENSORIZER_AUTHORITY_SOURCE_SHA256_CURRENT_V2 was overwritten in place; add a \
+             new frozen profile instead of moving this one"
+        );
+        assert_eq!(
+            FROZEN_TENSORIZER_FIXTURE_SHA256_CURRENT_V2,
+            "508490d5c2954e08abdc2fbaa1376cdf5bac38a1df7c52dde6b730108d8a122f",
+            "FROZEN_TENSORIZER_FIXTURE_SHA256_CURRENT_V2 was overwritten in place; add a new \
+             frozen profile instead of moving this one"
+        );
+        assert_eq!(
+            FROZEN_TENSORIZER_FIXTURE_PAYLOAD_SHA256_CURRENT_V2,
+            "ced890541cdad069b15f39d4a4708b52f1702a60a801256b0e1da7ca3d2ae5e9",
+            "FROZEN_TENSORIZER_FIXTURE_PAYLOAD_SHA256_CURRENT_V2 was overwritten in place; add a \
+             new frozen profile instead of moving this one"
+        );
+    }
+
     /// Regression tripwire for the real denovo-screen-256 decode outage
     /// (found by full-suite bisect, 2026-08-14): the two literals below are
     /// typed independently of `FROZEN_FULL_EPISODE_TRAJECTORY_GOLDENS_FILE_SHA256_HISTORICAL_V1`/
