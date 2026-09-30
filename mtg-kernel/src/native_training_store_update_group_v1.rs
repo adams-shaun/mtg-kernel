@@ -5326,13 +5326,14 @@ mod tests {
         // Re-baselined again for PR #111's CR 608.2 / 511.3 rules fixes: the
         // observation content those fixes deliberately changed (a resolving
         // spell on the stack during its choices; no stale combat record)
-        // moves both the byte length and the digest. Values are read from
-        // this test's failing run on x86_64-pc-windows-msvc; the linux-gnu
-        // arm below predates this branch and was already stale on
-        // x86_64-unknown-linux-gnu main, so it still needs a linux-gnu run.
+        // moves both the byte length and the digest. The windows-msvc arm was
+        // read from this test's failing run on x86_64-pc-windows-msvc and the
+        // linux-gnu arm from the same run on x86_64-unknown-linux-gnu (WSL2
+        // Ubuntu 22.04, glibc 2.35, pinned toolchain 1.94.1). The byte length
+        // is cross-target consistent (71_544 on both reviewed targets).
         #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
         const MAIN_GOLDEN_SHA256_V1: &str =
-            "befacadb1ed7cc774587779c087bcd6c429d83fc500ca1744d01b685e1300ddc";
+            "413b6408e0413032e198fc42257b6e30749c0742986e49d52539a20997078ba0";
         #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
         const MAIN_GOLDEN_SHA256_V1: &str =
             "ada351f494793226c55f80e585956895cb966e81e7e1241b5d9793463e93f5fe";
@@ -5786,8 +5787,16 @@ mod tests {
             // Re-based at the merge epoch under the owner-accepted ruling
             // (collab CLAUDE #236/#241), values read from the hosted
             // linux-gnu CI runs 31855835633 and 31863359780, witnessed by
-            // the 40/40 replay gate. Compared as one tuple so any future
-            // drift reports every pinned quantity in a single failing run.
+            // the 40/40 replay gate. Re-baselined again for PR #111's
+            // CR 608.2 / 511.3 rules fixes (same observation-derived
+            // rationale as the platform-independent pin below): values read
+            // from this test's failing run on x86_64-unknown-linux-gnu
+            // (WSL2 Ubuntu 22.04, glibc 2.35, pinned toolchain 1.94.1).
+            // Compared as one tuple so any future drift reports every
+            // pinned quantity in a single failing run. The canonical
+            // sha256 and byte length match
+            // sync_path_reproduces_mains_golden_store_hash's linux-gnu arm
+            // above, as they must (same synchronous pipeline).
             let canonical_sha256: [u8; 32] = Sha256::digest(group.canonical_bytes()).into();
             let observed = (
                 lower_hex_raw32_v1(canonical_sha256),
@@ -5795,9 +5804,9 @@ mod tests {
                 group.canonical_bytes().len(),
             );
             let pinned = (
-                "befacadb1ed7cc774587779c087bcd6c429d83fc500ca1744d01b685e1300ddc".to_owned(),
-                "48ea5707a925e904e876747abddebbacfee4fad8f0dcf8b345da017eabd0be63".to_owned(),
-                78_190usize,
+                "413b6408e0413032e198fc42257b6e30749c0742986e49d52539a20997078ba0".to_owned(),
+                "8e2f5100c40a1f1f95f2f9729587145daea17ea52f9e6b4993e0abc2e1747e78".to_owned(),
+                71_544usize,
             );
             assert_eq!(
                 observed, pinned,
